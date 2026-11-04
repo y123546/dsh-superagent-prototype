@@ -11,16 +11,23 @@ import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
 
-const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
+const WINDOWS = process.platform === 'win32'
+// [windows patch] A .cmd shim comments with `rem`, but the worker gitconfig must keep `#`, which git understands.
+const comment = (text: string): string => WINDOWS ? `rem ${text}` : `# ${text}`
+const MARKER_TEXT = 'Written by dsh-superagent on every start; edits are lost.'
+const MARKER = `# ${MARKER_TEXT}`
+/** Marker of a Windows shim, whose first line is `@echo off` so the comment cannot start with `#`. */
+const SHIM_MARKER = comment(MARKER_TEXT)
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
-const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].map(name => `# Written by ${name} on every start; edits are lost.`)
+const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].flatMap(name => [`# Written by ${name} on every start; edits are lost.`, comment(`Written by ${name} on every start; edits are lost.`)])
 /** Commands workers need, which `blockedCommands` cannot block: the shims and git. */
 export const WORKER_COMMANDS: readonly string[] = ['gh', 'git', 'lark-cli']
 export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bin')
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
+const winQuote = (value: string): string => `"${value.replaceAll('"', '""')}"`
 const gitQuote = (value: string): string => `"${value.replace(/[\\"]/g, char => `\\${char}`)}"`
-export const credentialHelper = (cli: string): string => `!${shellQuote(cli)} auth git-credential`
+export const credentialHelper = (cli: string): string => `!${WINDOWS ? winQuote(cli) : shellQuote(cli)} auth git-credential`
 
 export function sameDirectory(a: string, b: string): boolean {
   const real = (path: string): string => { try { return realpathSync(path) } catch { return resolve(path) } }
@@ -60,8 +67,8 @@ export function agentVariables(stateDir: string): Record<string, string | undefi
 /** True when a regular file starts with the dsh-superagent marker in its first two lines; a symbolic link, directory, or other non-regular file never counts as written by dsh-superagent. */
 async function written(file: string): Promise<boolean> {
   if (!(await lstat(file)).isFile()) return false
-  const head = (await readFile(file, 'utf8')).split('\n', 2)
-  return [MARKER, ...LEGACY_MARKERS].some(marker => head.includes(marker))
+  const head = (await readFile(file, 'utf8')).split('\n', 2).map(line => line.replace(/\r$/, ''))
+  return [MARKER, SHIM_MARKER, ...LEGACY_MARKERS].some(marker => head.includes(marker))
 }
 async function own(file: string, text: string, mode = 0o644): Promise<void> {
   let foreign = false
@@ -85,18 +92,27 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   // Workers may be running concurrently: write each shim to a temp file and atomically rename it so no command ever resolves past the shim directory.
   const kept = new Set<string>()
   const shim = async (name: string, body: string): Promise<void> => {
-    const temporary = join(dir, `.${name}.${process.pid}.tmp`)
-    await writeFile(temporary, `#!/bin/sh\n${MARKER}\n${body}\n`, { mode: 0o755 })
-    await rename(temporary, join(dir, name))
-    kept.add(name)
+    // [windows patch] PATH lookup needs a PATHEXT extension, so shims are `<name>.cmd` there.
+    const file = WINDOWS ? `${name}.cmd` : name
+    const temporary = join(dir, `.${file}.${process.pid}.tmp`)
+    const text = WINDOWS ? `@echo off\r\n${SHIM_MARKER}\r\n${body}\r\n` : `#!/bin/sh\n${MARKER}\n${body}\n`
+    await writeFile(temporary, text, { mode: 0o755 })
+    await rename(temporary, join(dir, file))
+    kept.add(file)
   }
   const withoutShims = [
     `self=${shellQuote(dir)}`, 'rest=', 'IFS=:', 'set -f',
     'for entry in $PATH; do [ "$entry" = "$self" ] || rest="${rest:+$rest:}$entry"; done',
     'set +f', 'unset IFS', 'PATH=$rest', 'export PATH',
   ].join('\n')
-  const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
-  const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
+  // [windows patch] A .cmd shim calls the real executable by absolute path (the shim dir is not on lookup once
+  // the executable name is absolute), and copies its own arguments through %*.
+  const run = (program: string): string => WINDOWS
+    ? `${winQuote(program)} %*`
+    : `${withoutShims}\nexec ${shellQuote(program)} "$@"`
+  const fail = (message: string): string => WINDOWS
+    ? `echo ${message} 1>&2\r\nexit /b 1`
+    : `echo ${shellQuote(message)} >&2\nexit 1`
   await shim('gh', run(github.cli))
   await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
